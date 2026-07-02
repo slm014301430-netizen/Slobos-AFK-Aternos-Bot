@@ -1224,19 +1224,6 @@ function createBot() {
       viewDistance: "tiny", // OPTIMIZATION: Only load the immediate block chunks to save Render RAM/CPU
     });
 
-    // Handle the spawn event cleanly:
-    bot.on('spawn', () => {
-      try {
-        // FIX: Turn off physics engine to drop CPU usage down to 0%
-        if (bot.physics) {
-          bot.physics.enabled = false; 
-        }
-        addLog("[Bot] Successfully spawned on server and physics disabled!");
-      } catch (err) {
-        addLog(`[Bot Error] Failed to alter physics: ${err.message}`);
-      }
-    });
-
     bot.loadPlugin(pathfinder);
 
     // FIX: connection timeout - end the old bot before reconnecting to avoid ghost bots
