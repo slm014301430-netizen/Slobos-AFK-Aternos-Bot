@@ -1131,6 +1131,8 @@ setInterval(
 // RECONNECTION & TIMEOUT MANAGEMENT
 // ============================================================
 let bot = null;
+let pendingBot = null;
+let nameChangeTimer = null;
 let activeIntervals = [];
 let reconnectTimeoutId = null;
 let connectionTimeoutId = null;
@@ -1182,6 +1184,136 @@ function getReconnectDelay() {
   );
   const jitter = Math.floor(Math.random() * 2000);
   return delay + jitter;
+}
+
+// ============================================================
+// VITAL LISTENERS (Extracted for Dual-Bot Handoff)
+// ============================================================
+function attachVitalListeners(b) {
+    b.on("kicked", (reason) => {
+      const kickReason = typeof reason === "object" ? JSON.stringify(reason) : reason;
+      addLog(`[Bot] Kicked: ${kickReason}`);
+      botState.connected = false;
+      botState.errors.push({ type: "kicked", reason: kickReason, time: Date.now() });
+      clearAllIntervals();
+
+      const reasonStr = String(kickReason).toLowerCase();
+      if (reasonStr.includes("throttl") || reasonStr.includes("wait before reconnect") || reasonStr.includes("too fast")) {
+        botState.wasThrottled = true;
+      }
+      if (config.discord && config.discord.events && config.discord.events.disconnect) {
+        sendDiscordWebhook(`[!] **Kicked**: ${kickReason}`, 0xff0000);
+      }
+    });
+
+    b.on("end", (reason) => {
+      // Prevent triggering reconnect if this bot is no longer the active one
+      if (b !== bot) return; 
+      
+      addLog(`[Bot] Disconnected: ${reason || "Unknown reason"}`);
+      botState.connected = false;
+      clearAllIntervals();
+      spawnHandled = false; 
+
+      if (config.discord && config.discord.events && config.discord.events.disconnect) {
+        sendDiscordWebhook(`[-] **Disconnected**: ${reason || "Unknown"}`, 0xf87171);
+      }
+      scheduleReconnect();
+    });
+
+    b.on("error", (err) => {
+      const msg = err.message || "";
+      addLog(`[Bot] Error: ${msg}`);
+      botState.errors.push({ type: "error", message: msg, time: Date.now() });
+    });
+}
+
+// ============================================================
+// HOURLY NAME ROTATION (DUAL-BOT HANDOFF)
+// ============================================================
+function generateRandomName() {
+  const prefixes = ['Kudo', 'Slobo', 'AFK', 'Bot', 'Mine', 'Guest', 'Player'];
+  const randomNum = Math.floor(1000 + Math.random() * 9000);
+  return `${prefixes[Math.floor(Math.random() * prefixes.length)]}_${randomNum}`;
+}
+
+function scheduleNameChange() {
+  // Change to 5 * 60 * 1000 if you want to test this every 5 minutes
+  const ONE_HOUR = 60 * 60 * 1000; 
+  
+  nameChangeTimer = setTimeout(() => {
+    const newName = generateRandomName();
+    addLog(`[Rotation] Hourly name change initiated. Connecting as: ${newName}`);
+    
+    if (pendingBot) {
+      try { pendingBot.quit(); } catch(e) {}
+      pendingBot = null;
+    }
+
+    const botVersion = config.server.version && config.server.version.trim() !== "" ? config.server.version : false;
+    
+    pendingBot = mineflayer.createBot({
+      username: newName,
+      password: config["bot-account"].password || undefined,
+      auth: config["bot-account"].type,
+      host: config.server.ip,
+      port: config.server.port,
+      version: botVersion,
+      hideErrors: true,
+      checkTimeoutInterval: 600000,
+      viewDistance: "tiny",
+    });
+
+    pendingBot.once('spawn', () => {
+      addLog(`[Rotation] ${newName} spawned. Handing off in 3 seconds...`);
+      
+      // CRITICAL OPTIMIZATION: Disable physics on the new bot immediately
+      if (pendingBot.physics) pendingBot.physics.enabled = false;
+      if (pendingBot.settings) pendingBot.settings.viewDistance = 2;
+      
+      attachVitalListeners(pendingBot);
+
+      setTimeout(() => {
+        // Kill old bot safely
+        if (bot) {
+          try {
+            bot.removeAllListeners(); // Prevents old bot from triggering reconnect
+            bot.quit();
+          } catch(e) {}
+        }
+        
+        // Swap global reference
+        bot = pendingBot;
+        pendingBot = null;
+        spawnHandled = true; 
+        
+        // Re-initialize modules on the new bot
+        const mcData = require("minecraft-data")(bot.version);
+        const defaultMove = new Movements(bot, mcData);
+        defaultMove.allowFreeMotion = false;
+        defaultMove.canDig = false;
+        defaultMove.liquidCost = 1000;
+        defaultMove.fallDamageCost = 1000;
+        
+        clearAllIntervals();
+        initializeModules(bot, mcData, defaultMove);
+        
+        addLog(`[Rotation] Handoff complete. Old bot disconnected.`);
+        
+        // Schedule next rotation
+        scheduleNameChange();
+      }, 3000);
+    });
+
+    pendingBot.on('error', (err) => addLog(`[Rotation] Pending bot error: ${err.message}`));
+    pendingBot.on('end', () => {
+      if (pendingBot) {
+        addLog(`[Rotation] Pending bot disconnected before handoff.`);
+        pendingBot = null;
+      }
+    });
+
+  }, ONE_HOUR);
 }
 
 function createBot() {
@@ -1245,6 +1377,9 @@ function createBot() {
     // FIX: guard against spawn firing twice (can happen on some servers)
     let spawnHandled = false;
 
+      // Attach listeners immediately
+    attachVitalListeners(bot);
+
     bot.once("spawn", () => {
       if (spawnHandled) return;
       spawnHandled = true;
@@ -1255,19 +1390,44 @@ function createBot() {
       botState.reconnectAttempts = 0;
       isReconnecting = false;
 
-      addLog(
-        `[Bot] [+] Successfully spawned on server! (Version: ${bot.version})`,
-      );
-      if (
-        config.discord &&
-        config.discord.events &&
-        config.discord.events.connect
-      ) {
-        sendDiscordWebhook(
-          `[+] **Connected** to \`${config.server.ip}\``,
-          0x4ade80,
-        );
+      // ==========================================
+      // CRITICAL RENDER FREE TIER OPTIMIZATIONS
+      // ==========================================
+      if (bot.physics) bot.physics.enabled = false; // Stops gravity/collision CPU drain
+      if (bot.settings) bot.settings.viewDistance = 2; // Forces tiny chunk loading
+      // ==========================================
+
+      addLog(`[Bot] [+] Successfully spawned on server! (Version: ${bot.version})`);
+      if (config.discord && config.discord.events && config.discord.events.connect) {
+        sendDiscordWebhook(`[+] **Connected** to \`${config.server.ip}\``, 0x4ade80);
       }
+
+      const mcData = require("minecraft-data")(bot.version);
+      const defaultMove = new Movements(bot, mcData);
+      defaultMove.allowFreeMotion = false;
+      defaultMove.canDig = false;
+      defaultMove.liquidCost = 1000;
+      defaultMove.fallDamageCost = 1000;
+
+      initializeModules(bot, mcData, defaultMove);
+
+      setTimeout(() => {
+        if (bot && botState.connected && config.server["try-creative"]) {
+          bot.chat("/gamemode creative");
+          addLog("[INFO] Attempted to set creative mode (requires OP)");
+        }
+      }, 3000);
+
+      bot.on("messagestr", (message) => {
+        if (message.includes("commands.gamemode.success.self") || message.includes("Set own game mode to Creative Mode")) {
+          addLog("[INFO] Bot is now in Creative Mode.");
+        }
+      });
+
+      // Start the hourly name change timer
+      if (nameChangeTimer) clearTimeout(nameChangeTimer);
+      scheduleNameChange();
+    });
 
       // FIX: use bot.version (auto-detected) instead of config value so minecraft-data always matches
       const mcData = require("minecraft-data")(bot.version);
@@ -1299,17 +1459,7 @@ function createBot() {
 
     // FIX: 'kicked' fires before 'end'. Remove the scheduleReconnect from 'kicked'
     // so that 'end' is the single source of reconnect truth, preventing double-trigger.
-    bot.on("kicked", (reason) => {
-      // FIX: stringify reason if it's an object to make it readable in logs
-      const kickReason =
-        typeof reason === "object" ? JSON.stringify(reason) : reason;
-      addLog(`[Bot] Kicked: ${kickReason}`);
-      botState.connected = false;
-      botState.errors.push({
-        type: "kicked",
-        reason: kickReason,
-        time: Date.now(),
-      });
+
       clearAllIntervals();
 
       const reasonStr = String(kickReason).toLowerCase();
@@ -1335,33 +1485,12 @@ function createBot() {
     });
 
     // FIX: 'end' is the single reconnect trigger
-    bot.on("end", (reason) => {
-      addLog(`[Bot] Disconnected: ${reason || "Unknown reason"}`);
-      botState.connected = false;
-      clearAllIntervals();
-      spawnHandled = false; // reset for next connection
 
-      if (
-        config.discord &&
-        config.discord.events &&
-        config.discord.events.disconnect
-      ) {
-        sendDiscordWebhook(
-          `[-] **Disconnected**: ${reason || "Unknown"}`,
-          0xf87171,
-        );
-      }
 
       // ALWAYS reconnect — bot must never leave the server
       scheduleReconnect();
     });
 
-    bot.on("error", (err) => {
-      const msg = err.message || "";
-      addLog(`[Bot] Error: ${msg}`);
-      botState.errors.push({ type: "error", message: msg, time: Date.now() });
-      // Don't reconnect on error - let 'end' event handle it
-    });
   } catch (err) {
     addLog(`[Bot] Failed to create bot: ${err.message}`);
     scheduleReconnect();
@@ -2043,14 +2172,22 @@ process.on("unhandledRejection", (reason) => {
     msg.includes("timed out") ||
     msg.includes("PartialReadError");
 
-  if (isNetworkError && !isReconnecting) {
-    addLog("[FATAL] Network rejection — triggering reconnect...");
-    clearAllIntervals();
-    botState.connected = false;
-    if (bot) {
+  if (isNetworkError && !    if (bot) {
       try { bot.end(); } catch (_) {}
       bot = null;
     }
+    if (pendingBot) {
+      try { pendingBot.end(); } catch (_) {}
+      pendingBot = null;
+    }
+    if (nameChangeTimer) {
+      clearTimeout(nameChangeTimer);
+      nameChangeTimer = null;
+    }isReconnecting) {
+    addLog("[FATAL] Network rejection — triggering reconnect...");
+    clearAllIntervals();
+    botState.connected = false;
+    
     scheduleReconnect();
   }
 });
