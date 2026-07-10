@@ -6,8 +6,8 @@
     "type": "offline"
   },
   "server": {
-    "ip": "Kudo_1316.aternos.me",
-    "port": 42916,
+    "ip": "MC_TM.aternos.me",
+    "port": 19083,
     "version": "1.21.4",
     "try-creative": false
   },
